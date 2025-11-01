@@ -1,0 +1,205 @@
+/*
+ * This is the Final One
+ */
+
+/*
+ * Name: Niharika Chhipa
+ * Student Number: 230159502
+ * GitHub Repository: https://github.com/niharikachhipa/Assignment3
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <time.h>
+#include <math.h>
+#include <limits.h>
+
+// ===========================
+// EDIT ONLY THESE ARRAYS
+// ===========================
+static const char* names_arr[]  = {"P1","P2","P3","P4","P5"};
+static const int   arrival_arr[] = { 0, 1, 2, 3, 4 };
+static const int   burst_arr[]    = {10, 5, 8, 6, 3 };
+// ===========================
+
+// Derive N from array length
+enum { N = (int)(sizeof(names_arr) / sizeof(names_arr[0])) };
+
+// Compile-time sanity checks (C11)
+_Static_assert((int)(sizeof(arrival_arr) / sizeof(arrival_arr[0])) == N,
+               "arrival length must match names length");
+_Static_assert((int)(sizeof(burst_arr) / sizeof(burst_arr[0])) == N,
+               "burst length must match names length");
+
+typedef struct {
+    const char* name;
+    int arrival;              // time units
+    int burst;                // time units
+    bool taken;
+    bool done;
+    int cpu_id;
+    double start_time;        // simulated units
+    double completion_time;   // simulated units
+    double waiting_time;      // start - arrival
+    double turnaround_time;   // completion - arrival
+} Proc;
+
+static Proc procs[N];
+
+// Synchronization
+static pthread_mutex_t ready_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+// Finished counter (atomic)
+static _Atomic int finished_count = 0;
+
+// Simulated time config: 1 time unit = UNIT_MS milliseconds
+static const int UNIT_MS = 50;
+
+// Use CLOCK_MONOTONIC if available; fallback to REALTIME
+#ifndef CLOCK_MONOTONIC
+#define CLOCK_MONOTONIC CLOCK_REALTIME
+#endif
+
+// Clock zero
+static struct timespec t0;
+
+// ms since t0 (double)
+static double ms_since_t0(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    double sec  = (double)(now.tv_sec  - t0.tv_sec);
+    double nsec = (double)(now.tv_nsec - t0.tv_nsec) / 1e9;
+    return (sec + nsec) * 1000.0;
+}
+
+// Current simulated time (in time units)
+static double now_units(void) {
+    double elapsed_ms = ms_since_t0();
+    return elapsed_ms / (double)UNIT_MS;
+}
+
+// Sleep for ms (integer)
+static void sleep_ms(int ms) {
+    if (ms <= 0) return;
+    struct timespec ts;
+    ts.tv_sec  = ms / 1000;
+    ts.tv_nsec = (long)((ms % 1000) * 1000000L);
+    nanosleep(&ts, NULL);
+}
+
+// Worker thread: arg is (intptr_t) cpu_id
+static void* cpu_worker(void* arg) {
+    int cpu_id = (int)(intptr_t)arg;
+
+    for (;;) {
+        if (atomic_load_explicit(&finished_count, memory_order_relaxed) == N)
+            break;
+
+        int pick = -1;
+        int best_burst = INT_MAX;
+
+        pthread_mutex_lock(&ready_mtx);
+
+        if (atomic_load_explicit(&finished_count, memory_order_relaxed) == N) {
+            pthread_mutex_unlock(&ready_mtx);
+            break;
+        }
+
+        // Recompute "now" inside the lock for consistent eligibility & start time
+        double now = now_units();
+
+        // SJF among eligible (arrival <= now), untaken, not done
+        for (int i = 0; i < N; ++i) {
+            Proc* p = &procs[i];
+            if (!p->taken && !p->done && p->arrival <= now) {
+                if (p->burst < best_burst || (p->burst == best_burst && i < pick)) {
+                    best_burst = p->burst;
+                    pick = i;
+                }
+            }
+        }
+
+        if (pick != -1) {
+            Proc* p = &procs[pick];
+            p->taken = true;       // reserve
+            p->cpu_id = cpu_id;
+            p->start_time = now;   // non-preemptive start at reservation
+        }
+
+        pthread_mutex_unlock(&ready_mtx);
+
+        if (pick == -1) {
+            int nap = UNIT_MS / 2;
+            if (nap < 1) nap = 1;
+            sleep_ms(nap);
+            continue;
+        }
+
+        // Run outside the lock
+        Proc* p = &procs[pick];
+        sleep_ms(p->burst * UNIT_MS);
+
+        double finish_now = now_units();
+
+        // Record completion and stats
+        pthread_mutex_lock(&ready_mtx);
+        p->completion_time = finish_now;
+        p->waiting_time    = p->start_time - p->arrival;
+        p->turnaround_time = p->completion_time - p->arrival;
+        p->done = true;
+        atomic_fetch_add_explicit(&finished_count, 1, memory_order_relaxed);
+        pthread_mutex_unlock(&ready_mtx);
+    }
+
+    return NULL;
+}
+
+int main(void) {
+    // Initialize process table
+    for (int i = 0; i < N; ++i) {
+        procs[i].name = names_arr[i];
+        procs[i].arrival = arrival_arr[i];
+        procs[i].burst = burst_arr[i];
+        procs[i].taken = false;
+        procs[i].done  = false;
+        procs[i].cpu_id = -1;
+        procs[i].start_time = -1.0;
+        procs[i].completion_time = -1.0;
+        procs[i].waiting_time = 0.0;
+        procs[i].turnaround_time = 0.0;
+    }
+
+    // Start clock
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    // Launch exactly two worker threads
+    pthread_t t0h, t1h;
+    pthread_create(&t0h, NULL, cpu_worker, (void*)(intptr_t)0);
+    pthread_create(&t1h, NULL, cpu_worker, (void*)(intptr_t)1);
+
+    pthread_join(t0h, NULL);
+    pthread_join(t1h, NULL);
+
+    // Print per-process lines in index order (stable)
+    double sumW = 0.0, sumT = 0.0;
+
+    for (int i = 0; i < N; ++i) {
+        const Proc* p = &procs[i];
+        long long W = llround(p->waiting_time);
+        long long T = llround(p->turnaround_time);
+
+        printf("Process: %s Arrival: %d Burst: %d CPU: %d Waiting Time: %lld Turnaround Time: %lld\n",
+               p->name, p->arrival, p->burst, p->cpu_id, W, T);
+
+        sumW += p->waiting_time;
+        sumT += p->turnaround_time;
+    }
+
+    printf("Average waiting time = %.2f\n", sumW / (double)N);
+    printf("Average turnaround time = %.2f\n", sumT / (double)N);
+
+    return 0;
+}

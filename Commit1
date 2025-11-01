@@ -1,0 +1,168 @@
+/*
+ * Name: Niharika Chhipa
+ * Student Number: 230159502
+ * GitHub Repository: 
+ */
+
+
+#include <iostream>
+#include <vector>
+#include <string>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <climits>
+#include <iomanip>
+using namespace std;
+
+// ===========================
+// EDIT ONLY THESE ARRAYS
+// ===========================
+static const char* names_arr[] = {"P1","P2","P3","P4","P5"};
+static const int    arrival_arr[] = { 0, 1, 2, 3, 4 };
+static const int    burst_arr[]   = {10, 5, 8, 6, 3 };
+// ===========================
+
+static constexpr size_t N = sizeof(names_arr)/sizeof(names_arr[0]);
+static_assert(sizeof(arrival_arr)/sizeof(arrival_arr[0]) == N, "arrival length must match names length");
+static_assert(sizeof(burst_arr)/sizeof(burst_arr[0])     == N, "burst length must match names length");
+
+struct Proc {
+    string name;
+    int arrival;     // time units
+    int burst;       // time units
+    bool taken = false;
+    bool done  = false;
+    int cpu_id = -1;
+    double start_time = -1.0;
+    double completion_time = -1.0;
+    double waiting_time = 0.0;
+    double turnaround_time = 0.0;
+};
+
+static vector<Proc> procs;
+
+static mutex ready_mtx;          // protects selection & state transitions
+static atomic<size_t> finished_count{0};
+
+static const int UNIT_MS = 50;   // 1 simulated time unit = 50 ms wall clock
+static chrono::steady_clock::time_point t0;
+
+static inline double now_units() {
+    using namespace std::chrono;
+    auto elapsed_ms = duration_cast<milliseconds>(steady_clock::now() - t0).count();
+    return static_cast<double>(elapsed_ms) / static_cast<double>(UNIT_MS);
+}
+
+// Worker thread representing a CPU core (id = 0 or 1)
+void cpu_worker(int cpu_id) {
+    using namespace std::chrono;
+
+    while (true) {
+        if (finished_count.load(std::memory_order_relaxed) == N) break;
+
+        int pick = -1;
+        int best_burst = INT_MAX;
+        double picked_start = -1.0;  // capture start time at reservation
+
+        {
+            lock_guard<mutex> lk(ready_mtx);
+
+            if (finished_count.load(std::memory_order_relaxed) == N) break;
+
+            // Recompute "now" inside the lock for consistent eligibility & start time
+            double now = now_units();
+
+            // SJF among eligible (arrival <= now), untaken, not done
+            for (size_t i = 0; i < N; ++i) {
+                auto &p = procs[i];
+                if (!p.taken && !p.done && p.arrival <= now) {
+                    if (p.burst < best_burst ||
+                       (p.burst == best_burst && static_cast<int>(i) < pick)) { // deterministic tie-break by index
+                        best_burst = p.burst;
+                        pick = static_cast<int>(i);
+                    }
+                }
+            }
+
+            if (pick != -1) {
+                Proc &p = procs[pick];
+                p.taken = true;           // reserve the job
+                p.cpu_id = cpu_id;
+                // start time is "now" at reservation (non-preemptive start)
+                p.start_time = now;
+                picked_start = p.start_time;
+            }
+        }
+
+        if (pick == -1) {
+            // No eligible job yet: brief nap proportional to the time unit
+            this_thread::sleep_for(milliseconds(max(1, UNIT_MS / 2)));
+            continue;
+        }
+
+        // "Run" outside the lock
+        Proc &p = procs[pick];
+        this_thread::sleep_for(milliseconds(p.burst * UNIT_MS));
+
+        // Record completion and stats
+        double finish_now = now_units();
+        {
+            lock_guard<mutex> lk(ready_mtx);
+            // Use measured finish time; turn it into simulated units
+            p.completion_time = finish_now;
+            // Stats
+            p.waiting_time = p.start_time - p.arrival;
+            p.turnaround_time = p.completion_time - p.arrival;
+            p.done = true;
+            finished_count.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+}
+
+int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    procs.reserve(N);
+    for (size_t i = 0; i < N; ++i) {
+        procs.push_back(Proc{names_arr[i], arrival_arr[i], burst_arr[i]});
+    }
+
+    t0 = chrono::steady_clock::now();
+
+    thread cpu0(cpu_worker, 0);
+    thread cpu1(cpu_worker, 1);
+    cpu0.join();
+    cpu1.join();
+
+    // Print per-process lines at the end in index order to match the example style
+    double sumW = 0.0, sumT = 0.0;
+
+    for (size_t i = 0; i < N; ++i) {
+        const auto &p = procs[i];
+        // Round to nearest integer like the example
+        long long W = llround(p.waiting_time);
+        long long T = llround(p.turnaround_time);
+
+        cout << "Process: " << p.name
+             << " Arrival: " << p.arrival
+             << " Burst: " << p.burst
+             << " CPU: " << p.cpu_id
+             << " Waiting Time: " << W
+             << " Turnaround Time: " << T
+             << "\n";
+
+        sumW += p.waiting_time;
+        sumT += p.turnaround_time;
+    }
+
+    cout.setf(std::ios::fixed);
+    cout << setprecision(2);
+    cout << "Average waiting time = " << (sumW / static_cast<double>(N)) << "\n";
+    cout << "Average turnaround time = " << (sumT / static_cast<double>(N)) << "\n";
+
+    return 0;
+}
